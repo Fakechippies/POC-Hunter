@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -24,8 +27,11 @@ const (
 type options struct {
 	pocMode    bool
 	searchMode bool
+	vendor     string
 	app        string
 	version    string
+	ecosystem  string
+	sources    []string
 	timeout    time.Duration
 }
 
@@ -43,8 +49,11 @@ func Execute() error {
 
 	rootCmd.Flags().BoolVar(&opts.pocMode, "poc", false, "direct POC mode (treat input as CVE id)")
 	rootCmd.Flags().BoolVar(&opts.searchMode, "search", false, "keyword search mode")
+	rootCmd.Flags().StringVar(&opts.vendor, "vendor", "", "vendor name")
 	rootCmd.Flags().StringVar(&opts.app, "app", "", "application/product name")
 	rootCmd.Flags().StringVar(&opts.version, "version", "", "application version")
+	rootCmd.Flags().StringVar(&opts.ecosystem, "ecosystem", "", "package ecosystem (for sources that use it)")
+	rootCmd.Flags().StringSliceVar(&opts.sources, "sources", nil, "CVE sources to use (comma-separated: nvd,circl,osv,vulners,github)")
 	rootCmd.Flags().DurationVar(&opts.timeout, "timeout", 30*time.Second, "request timeout")
 
 	rootCmd.SetArgs(normalizeCompatFlags(os.Args[1:]))
@@ -70,7 +79,7 @@ func run(args []string, opts options) error {
 	ctx, cancel := context.WithTimeout(context.Background(), opts.timeout)
 	defer cancel()
 
-	cveSources := []cve.Source{cve.NVDSource{}}
+	cveSources := buildCVESourcesFromEnv(opts.sources)
 	pocSources := []poc.Source{poc.POCInGithub{}}
 
 	if opts.pocMode {
@@ -83,78 +92,250 @@ func run(args []string, opts options) error {
 		return nil
 	}
 
-	product, version, err := resolveSearchInput(args, opts)
+	vendor, product, version, ecosystem, err := resolveSearchInput(args, opts)
 	if err != nil {
 		return err
 	}
 
-	progressf("Searching CVEs for %s %s", product, version)
+	progressf("Searching CVEs for vendor=%q product=%q version=%q ecosystem=%q", vendor, product, version, ecosystem)
 
-	var allCVEs []cve.Finding
-	seen := map[string]struct{}{}
-	for _, source := range cveSources {
-		findings, err := source.Query(ctx, product, version)
-		if err != nil {
-			errorf("%s query failed: %v", source.Name(), err)
-			continue
-		}
-		printCVEFindings(source.Name(), findings)
-		for _, finding := range findings {
-			if _, ok := seen[finding.CVE]; ok {
-				continue
-			}
-			seen[finding.CVE] = struct{}{}
-			allCVEs = append(allCVEs, finding)
-		}
-	}
-
-	if len(allCVEs) == 0 {
+	cveResults := collectCVEs(ctx, cveSources, vendor, product, version, ecosystem)
+	allCVEFindings, uniqueCVEs := dedupeCVEs(cveResults)
+	if len(allCVEFindings) == 0 {
+		printCVESourceErrors(cveResults)
 		warnf("No CVEs found for query")
 		return nil
 	}
 
-	for _, finding := range allCVEs {
-		progressf("Searching POCs for %s", finding.CVE)
-		runPOCSources(ctx, pocSources, finding.CVE)
+	printCVEFindings("CVE Discovery", allCVEFindings)
+	successf("Unique CVEs: %d", len(uniqueCVEs))
+	printCVESourceErrors(cveResults)
+
+	progressf("Searching POCs for %d CVEs", len(uniqueCVEs))
+	pocResults := collectPOCsForCVEs(ctx, pocSources, uniqueCVEs)
+	printPOCErrors(pocResults)
+	allPOCs := flattenPOCResults(pocResults)
+	if len(allPOCs) == 0 {
+		warnf("No POCs found across discovered CVEs")
+		return nil
 	}
 
+	printPOCFindings("POC Discovery", allPOCs)
 	return nil
 }
 
-func resolveSearchInput(args []string, opts options) (string, string, error) {
+type cveSourceResult struct {
+	source   string
+	findings []cve.Finding
+	err      error
+}
+
+type pocResult struct {
+	cveID    string
+	findings []poc.Finding
+	err      error
+}
+
+func buildCVESourcesFromEnv(want []string) []cve.Source {
+	all := map[string]cve.Source{
+		"nvd":    cve.NVDSource{},
+		"circl":  cve.CIRCLSource{},
+		"osv":    cve.OSVSource{},
+		"vulners": nil,
+		"github":  nil,
+	}
+	if key := strings.TrimSpace(os.Getenv("VULNERS_API_KEY")); key != "" {
+		all["vulners"] = &cve.VulnersSource{APIKey: key}
+	}
+	if key := strings.TrimSpace(os.Getenv("GITHUB_TOKEN")); key != "" {
+		all["github"] = cve.GithubSource{APIKey: key}
+	}
+
+	filter := make(map[string]bool, len(want))
+	for _, name := range want {
+		filter[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+
+	var sources []cve.Source
+	for key, src := range all {
+		if src == nil {
+			continue
+		}
+		if len(filter) > 0 && !filter[key] {
+			continue
+		}
+		sources = append(sources, src)
+	}
+	sort.Slice(sources, func(i, j int) bool { return sources[i].Name() < sources[j].Name() })
+	return sources
+}
+
+func collectCVEs(ctx context.Context, sources []cve.Source, vendor, product, version, ecosystem string) []cveSourceResult {
+	results := make(chan cveSourceResult, len(sources))
+	var wg sync.WaitGroup
+
+	for _, source := range sources {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			findings, err := source.Query(ctx, vendor, product, version, ecosystem)
+			results <- cveSourceResult{source: source.Name(), findings: findings, err: err}
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	out := make([]cveSourceResult, 0, len(sources))
+	for result := range results {
+		out = append(out, result)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].source < out[j].source })
+	return out
+}
+
+func dedupeCVEs(results []cveSourceResult) ([]cve.Finding, []string) {
+	var all []cve.Finding
+	seenRow := map[string]struct{}{}
+	seenCVE := map[string]struct{}{}
+	var cveIDs []string
+
+	for _, result := range results {
+		for _, finding := range result.findings {
+			key := finding.CVE + "|" + finding.Source + "|" + finding.Detail
+			if _, ok := seenRow[key]; ok {
+				continue
+			}
+			seenRow[key] = struct{}{}
+			all = append(all, finding)
+
+			if _, ok := seenCVE[finding.CVE]; !ok {
+				seenCVE[finding.CVE] = struct{}{}
+				cveIDs = append(cveIDs, finding.CVE)
+			}
+		}
+	}
+
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].CVE == all[j].CVE {
+			return all[i].Source < all[j].Source
+		}
+		return all[i].CVE < all[j].CVE
+	})
+	sort.Strings(cveIDs)
+	return all, cveIDs
+}
+
+func collectPOCsForCVEs(ctx context.Context, sources []poc.Source, cveIDs []string) []pocResult {
+	const maxWorkers = 8
+	sem := make(chan struct{}, maxWorkers)
+	results := make(chan pocResult, len(cveIDs))
+	var wg sync.WaitGroup
+
+	for _, cveID := range cveIDs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			findings, err := queryPOCsForCVE(ctx, sources, cveID)
+			results <- pocResult{cveID: cveID, findings: findings, err: err}
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	out := make([]pocResult, 0, len(cveIDs))
+	for result := range results {
+		out = append(out, result)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].cveID < out[j].cveID })
+	return out
+}
+
+func queryPOCsForCVE(ctx context.Context, sources []poc.Source, cveID string) ([]poc.Finding, error) {
+	var all []poc.Finding
+	for _, source := range sources {
+		findings, err := source.Query(ctx, cveID)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", source.Name(), err)
+		}
+		all = append(all, findings...)
+	}
+	return all, nil
+}
+
+func flattenPOCResults(results []pocResult) []poc.Finding {
+	var all []poc.Finding
+	for _, result := range results {
+		all = append(all, result.findings...)
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].CVE == all[j].CVE {
+			if all[i].Owner == all[j].Owner {
+				return all[i].POC < all[j].POC
+			}
+			return all[i].Owner < all[j].Owner
+		}
+		return all[i].CVE < all[j].CVE
+	})
+	return all
+}
+
+func printPOCErrors(results []pocResult) {
+	for _, result := range results {
+		if result.err != nil {
+			warnf("%s: %v", result.cveID, result.err)
+		}
+	}
+}
+
+func printCVESourceErrors(results []cveSourceResult) {
+	for _, result := range results {
+		if result.err != nil {
+			warnf("%s: %v", result.source, result.err)
+		}
+	}
+}
+
+func resolveSearchInput(args []string, opts options) (string, string, string, string, error) {
+	vendor := strings.TrimSpace(opts.vendor)
+	ecosystem := strings.TrimSpace(opts.ecosystem)
+
 	if opts.app != "" {
 		tokens := []string{opts.app}
 		tokens = append(tokens, args...)
 
 		if opts.version != "" {
-			return strings.Join(tokens, " "), opts.version, nil
+			return vendor, strings.Join(tokens, " "), opts.version, ecosystem, nil
 		}
 		if len(tokens) < 2 {
-			return "", "", fmt.Errorf("--app mode expects version in --version or as the last argument")
+			return "", "", "", "", fmt.Errorf("--app mode expects version in --version or as the last argument")
 		}
 
 		product := strings.Join(tokens[:len(tokens)-1], " ")
 		version := tokens[len(tokens)-1]
-		return product, version, nil
+		return vendor, product, version, ecosystem, nil
 	}
 
 	if opts.version != "" {
 		if len(args) == 0 {
-			return "", "", fmt.Errorf("--version requires product query words or --app")
+			return "", "", "", "", fmt.Errorf("--version requires product query words or --app")
 		}
-		return strings.Join(args, " "), opts.version, nil
+		return vendor, strings.Join(args, " "), opts.version, ecosystem, nil
 	}
 
 	if opts.searchMode || len(args) > 0 {
 		if len(args) < 2 {
-			return "", "", fmt.Errorf("keyword mode expects: --search <product words...> <version>")
+			return "", "", "", "", fmt.Errorf("keyword mode expects: --search <product words...> <version>")
 		}
 		product := strings.Join(args[:len(args)-1], " ")
 		version := args[len(args)-1]
-		return product, version, nil
+		return vendor, product, version, ecosystem, nil
 	}
 
-	return "", "", fmt.Errorf("provide search input via --search <product words...> <version> or --app <name> --version <version>")
+	return "", "", "", "", fmt.Errorf("provide search input via --search <product words...> <version> or --app <name> --version <version>")
 }
 
 func runPOCSources(ctx context.Context, sources []poc.Source, cveID string) {
@@ -186,13 +367,39 @@ func printCVEFindings(source string, findings []cve.Finding) {
 		return
 	}
 
-	successf("%s: %d CVEs", source, len(findings))
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "CVE\tSOURCE\tDETAIL")
-	for _, finding := range findings {
-		fmt.Fprintf(w, "%s\t%s\t%s\n", finding.CVE, finding.Source, finding.Detail)
+	successf("%s: %d findings", source, len(findings))
+
+	cveW := len("CVE")
+	srcW := len("SOURCE")
+	for _, f := range findings {
+		if len(f.CVE) > cveW {
+			cveW = len(f.CVE)
+		}
+		if len(f.Source) > srcW {
+			srcW = len(f.Source)
+		}
 	}
-	_ = w.Flush()
+	gap := 2
+	detailW := terminalWidth() - cveW - srcW - gap*2
+	if detailW < 20 {
+		detailW = 20
+	}
+
+	fmt.Printf("%-*s%*s  %s\n", cveW, "CVE", srcW+gap, "SOURCE", "DETAIL")
+	fmt.Printf("%s%s  %s\n", strings.Repeat("-", cveW), strings.Repeat("-", srcW+gap), strings.Repeat("-", detailW))
+
+	for _, f := range findings {
+		detail := strings.ReplaceAll(f.Detail, "\n", " ")
+		detail = strings.ReplaceAll(detail, "\r", "")
+		lines := wrapText(detail, detailW)
+		for i, line := range lines {
+			if i == 0 {
+				fmt.Printf("%-*s%*s  %s\n", cveW, f.CVE, srcW+gap, f.Source, line)
+			} else {
+				fmt.Printf("%-*s%*s  %s\n", cveW, "", srcW+gap, "", line)
+			}
+		}
+	}
 }
 
 func printPOCFindings(source string, findings []poc.Finding) {
@@ -219,4 +426,37 @@ func warnf(format string, args ...interface{}) {
 
 func errorf(format string, args ...interface{}) {
 	fmt.Printf("%s[!]%s %s\n", colorRed, colorReset, fmt.Sprintf(format, args...))
+}
+
+func terminalWidth() int {
+	const defaultWidth = 80
+	if cols := os.Getenv("COLUMNS"); cols != "" {
+		if w, err := strconv.Atoi(cols); err == nil && w > 0 {
+			return w
+		}
+	}
+	return defaultWidth
+}
+
+func wrapText(s string, width int) []string {
+	if width <= 0 || s == "" {
+		return []string{s}
+	}
+	var lines []string
+	for _, word := range strings.Fields(s) {
+		if len(lines) == 0 {
+			lines = append(lines, word)
+			continue
+		}
+		last := len(lines) - 1
+		if len(lines[last])+1+len(word) > width {
+			lines = append(lines, word)
+		} else {
+			lines[last] += " " + word
+		}
+	}
+	if len(lines) == 0 {
+		return []string{""}
+	}
+	return lines
 }

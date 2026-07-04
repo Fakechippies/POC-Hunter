@@ -14,7 +14,7 @@ type NVDSource struct{}
 
 func (o NVDSource) Name() string { return "NVD" }
 
-func (o NVDSource) Query(ctx context.Context, product, version string) ([]Finding, error) {
+func (o NVDSource) Query(ctx context.Context, vendor, product, version, ecosystem string) ([]Finding, error) {
 	targeted, err := o.queryByKeyword(ctx, product+" "+version)
 	if err != nil {
 		return nil, err
@@ -36,7 +36,7 @@ func (o NVDSource) Query(ctx context.Context, product, version string) ([]Findin
 }
 
 func (o NVDSource) queryByKeyword(ctx context.Context, keyword string) ([]Finding, error) {
-	URL := fmt.Sprintf("https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=%s&resultsPerPage=2000",
+	URL := fmt.Sprintf("https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=%s&resultsPerPage=200",
 		url.QueryEscape(strings.TrimSpace(keyword)),
 	)
 	var nvdResp struct {

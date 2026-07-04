@@ -9,6 +9,6 @@ type Finding struct {
 }
 
 type Source interface {
-	Query(ctx context.Context, product, version string) ([]Finding, error)
+	Query(ctx context.Context, vendor, product, version, ecosystem string) ([]Finding, error)
 	Name() string
 }
