@@ -7,6 +7,7 @@ type Finding struct {
 	POC      string
 	PushedAt string
 	Owner    string
+	Source   string
 }
 
 type Source interface {

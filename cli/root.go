@@ -80,7 +80,7 @@ func run(args []string, opts options) error {
 	defer cancel()
 
 	cveSources := buildCVESourcesFromEnv(opts.sources)
-	pocSources := []poc.Source{poc.POCInGithub{}}
+	pocSources := buildPOCSources()
 
 	if opts.pocMode {
 		if len(args) == 0 {
@@ -170,6 +170,15 @@ func buildCVESourcesFromEnv(want []string) []cve.Source {
 	return sources
 }
 
+func buildPOCSources() []poc.Source {
+	var sources []poc.Source
+	sources = append(sources, poc.POCInGithub{})
+	if key := strings.TrimSpace(os.Getenv("SEARCHVULNS_API_KEY")); key != "" {
+		sources = append(sources, poc.SearchVulns{APIKey: key})
+	}
+	return sources
+}
+
 func collectCVEs(ctx context.Context, sources []cve.Source, vendor, product, version, ecosystem string) []cveSourceResult {
 	results := make(chan cveSourceResult, len(sources))
 	var wg sync.WaitGroup
@@ -255,13 +264,27 @@ func collectPOCsForCVEs(ctx context.Context, sources []poc.Source, cveIDs []stri
 }
 
 func queryPOCsForCVE(ctx context.Context, sources []poc.Source, cveID string) ([]poc.Finding, error) {
-	var all []poc.Finding
+	results := make(chan pocSourceResult, len(sources))
+	var wg sync.WaitGroup
+
 	for _, source := range sources {
-		findings, err := source.Query(ctx, cveID)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", source.Name(), err)
+		wg.Add(1)
+		go func(s poc.Source) {
+			defer wg.Done()
+			findings, err := s.Query(ctx, cveID)
+			results <- pocSourceResult{name: s.Name(), findings: findings, err: err}
+		}(source)
+	}
+
+	wg.Wait()
+	close(results)
+
+	var all []poc.Finding
+	for result := range results {
+		if result.err != nil {
+			return nil, fmt.Errorf("%s: %w", result.name, result.err)
 		}
-		all = append(all, findings...)
+		all = append(all, result.findings...)
 	}
 	return all, nil
 }
@@ -338,19 +361,39 @@ func resolveSearchInput(args []string, opts options) (string, string, string, st
 	return "", "", "", "", fmt.Errorf("provide search input via --search <product words...> <version> or --app <name> --version <version>")
 }
 
+type pocSourceResult struct {
+	name     string
+	findings []poc.Finding
+	err      error
+}
+
 func runPOCSources(ctx context.Context, sources []poc.Source, cveID string) {
-	foundAny := false
+	results := make(chan pocSourceResult, len(sources))
+	var wg sync.WaitGroup
+
 	for _, source := range sources {
-		findings, err := source.Query(ctx, cveID)
-		if err != nil {
-			errorf("%s: %v", source.Name(), err)
+		wg.Add(1)
+		go func(s poc.Source) {
+			defer wg.Done()
+			findings, err := s.Query(ctx, cveID)
+			results <- pocSourceResult{name: s.Name(), findings: findings, err: err}
+		}(source)
+	}
+
+	wg.Wait()
+	close(results)
+
+	foundAny := false
+	for result := range results {
+		if result.err != nil {
+			errorf("%s: %v", result.name, result.err)
 			continue
 		}
-		if len(findings) == 0 {
+		if len(result.findings) == 0 {
 			continue
 		}
 		foundAny = true
-		printPOCFindings(source.Name(), findings)
+		printPOCFindings(result.name, result.findings)
 	}
 	if !foundAny {
 		warnf("%s: no POCs found", cveID)
@@ -405,9 +448,13 @@ func printCVEFindings(source string, findings []cve.Finding) {
 func printPOCFindings(source string, findings []poc.Finding) {
 	successf("%s: %d POCs", source, len(findings))
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "CVE\tOWNER\tPUSHED AT\tPOC")
+	fmt.Fprintln(w, "CVE\tSOURCE\tOWNER\tPUSHED AT\tPOC")
 	for _, finding := range findings {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", finding.CVE, finding.Owner, finding.PushedAt, finding.POC)
+		src := finding.Source
+		if src == "" {
+			src = source
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", finding.CVE, src, finding.Owner, finding.PushedAt, finding.POC)
 	}
 	_ = w.Flush()
 }

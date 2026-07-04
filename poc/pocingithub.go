@@ -31,13 +31,13 @@ func (o POCInGithub) Query(ctx context.Context, CVE string) ([]Finding, error) {
 
 	var findings []Finding
 	for _, poc := range response.POCs {
-		var find Finding
-		find.CVE = CVE
-		find.Owner = poc.Owner
-		find.POC = poc.POCURL
-		find.PushedAt = poc.PushedAt
-
-		findings = append(findings, find)
+		findings = append(findings, Finding{
+			CVE:      CVE,
+			Owner:    poc.Owner,
+			POC:      poc.POCURL,
+			PushedAt: poc.PushedAt,
+			Source:   "poc-in-github",
+		})
 	}
 
 	return findings, nil

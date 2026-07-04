@@ -6,7 +6,7 @@ CLI tool to discover CVEs for a product/version query and then hunt public POCs 
 
 - CVE discovery from **NVD**, **CIRCL**, **OSV**, **Vulners**, and **GitHub Advisories**
 - All CVE sources queried concurrently, results deduplicated
-- POC discovery from **poc-in-github** with a configurable worker pool (max 8)
+- POC discovery from **poc-in-github** and **search-vulns** with a configurable worker pool (max 8)
 - Direct POC mode with `--poc` / `-poc`
 - Version variant matching (example: `2.2.0` can match `v2.2.x`)
 - Selectable CVE sources via `--sources` flag
@@ -54,6 +54,14 @@ export GITHUB_TOKEN="<your-github-token>"
 
 These are automatically included when their env var is set, and can be filtered with `--sources`.
 
+Optional API-backed POC sources:
+
+```bash
+export SEARCHVULNS_API_KEY="<your-search-vulns-key>"
+```
+
+Automatically included when the env var is set.
+
 ### 2) Direct POC mode
 
 Skip CVE discovery and directly search POCs by CVE ID.
@@ -96,13 +104,65 @@ go run ./cmd/pochunter -poc CVE 2026 38526
 
 ## POC sources
 
-| Source          | Description                                      |
-|-----------------|--------------------------------------------------|
-| `poc-in-github` | Queries `poc-in-github.motikan2010.net/api/v1/?cve_id=` |
+| Source          | Auth                 | Description                                      |
+|-----------------|----------------------|--------------------------------------------------|
+| `poc-in-github` | None                 | Queries `poc-in-github.motikan2010.net/api/v1/?cve_id=` |
+| `search-vulns`  | `SEARCHVULNS_API_KEY`| Queries `search-vulns.com/api/search-vulns?query=` |
+
+## Library usage
+
+This is also a Go library. Import the packages you need:
+
+```go
+import (
+    "context"
+    "time"
+
+    "github.com/Fakechippies/pochunter/cve"
+    "github.com/Fakechippies/pochunter/poc"
+)
+
+func findCVEs(ctx context.Context, product, version string) ([]cve.Finding, error) {
+    src := cve.NVDSource{}
+    return src.Query(ctx, "", product, version, "")
+}
+
+func findPOCs(ctx context.Context, cveID string) ([]poc.Finding, error) {
+    src := poc.POCInGithub{}
+    return src.Query(ctx, cveID)
+}
+
+func multiSource(ctx context.Context, product, version string) ([]cve.Finding, error) {
+    sources := []cve.Source{
+        cve.NVDSource{},
+        cve.CIRCLSource{},
+        cve.OSVSource{},
+    }
+    ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+    defer cancel()
+
+    var all []cve.Finding
+    for _, s := range sources {
+        findings, err := s.Query(ctx, "", product, version, "npm")
+        if err != nil {
+            continue
+        }
+        all = append(all, findings...)
+    }
+    return all, nil
+}
+```
+
+### Packages
+
+| Package        | Import path                                    | Description |
+|----------------|------------------------------------------------|-------------|
+| `cve`          | `github.com/Fakechippies/pochunter/cve`        | Source interface + NVD, CIRCL, OSV, Vulners, GitHub Advisories |
+| `poc`          | `github.com/Fakechippies/pochunter/poc`        | Source interface + poc-in-github, search-vulns |
+| `versioncanon` | `github.com/Fakechippies/pochunter/versioncanon`| Version variant generation for fuzzy matching |
 
 ## TODO:
 
-- [ ] Add more POC providers
 - [ ] Add output formats (JSON/CSV).
 - [ ] Add caching and retry/backoff.
 - [ ] Add unit tests for version canonicalization and source adapters.
