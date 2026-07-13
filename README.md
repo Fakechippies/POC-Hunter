@@ -1,6 +1,6 @@
 # POC-Hunter
 
-CLI tool to discover CVEs for a product/version query and then hunt public POCs for each CVE.
+CLI tool to discover CVEs and hunt public POCs, free-form search or structured product/version queries.
 
 ## What it does
 
@@ -10,6 +10,8 @@ CLI tool to discover CVEs for a product/version query and then hunt public POCs 
 - Direct POC mode with `--poc` / `-poc`
 - Version variant matching (example: `2.2.0` can match `v2.2.x`)
 - Selectable CVE sources via `--sources` flag
+- CVSS scoring: free-form search results sorted by score with a SCORE column
+- Terminal width auto-detection (ioctl TIOCGWINSZ) for full-screen table output
 - Proper table formatting with word-wrapped DETAIL column
 - Vulners source uses `/api/v4/audit/software` (CPE-based, partial match, extended catalog)
 
@@ -22,28 +24,39 @@ go install github.com/Fakechippies/pochunter/cmd/pochunter@latest
 Then run:
 
 ```bash
-pochunter --search <APP-NAME> <VERSION>
+pochunter --search <keywords...>
 ```
 
 ## Modes
 
-### 1) Keyword mode (default)
+### 1) Free-form search (default)
 
-Use one of these:
-- `--search <product words...> <version>`
-- `--app <product> --version <version>`
-- add optional source hints:
-  - `--vendor <vendor>`
-  - `--ecosystem <ecosystem>`
-  - `--sources <list>` — restrict CVE sources (comma-separated: `nvd,circl,osv,vulners,github`)
+Dump any keywords: no version required. Results are sorted by CVSS score (highest first) and include a SCORE column.
 
 ```bash
-go run ./cmd/pochunter --search <KEYWORDS>
-go run ./cmd/pochunter --app "<APP-NAME>" --version <VERSION>
+go run ./cmd/pochunter --search ShellShock
+go run ./cmd/pochunter --search shellshock 4.3 bash
+go run ./cmd/pochunter --search log4j
 go run ./cmd/pochunter --search Krayin CRM 2.20 --vendor Webkul --ecosystem php
-go run ./cmd/pochunter --app django --version 3.2 --ecosystem PyPI --timeout 20s
 go run ./cmd/pochunter --search django 4.2 --sources nvd,vulners
 ```
+
+### 2) Structured product/version mode
+
+For precise product/version lookups:
+
+```bash
+go run ./cmd/pochunter --app django --version 3.2 --ecosystem PyPI --timeout 20s
+go run ./cmd/pochunter --app "<APP-NAME>" --version <VERSION>
+```
+
+Optional source hints for either mode:
+
+| Flag | Description |
+|------|-------------|
+| `--vendor` | Vendor name (search hint) |
+| `--ecosystem` | Package ecosystem (`npm`, `pypi`, `go`, `maven`, etc.) |
+| `--sources` | Comma-separated CVE sources (`nvd,circl,osv,vulners,github`) |
 
 Optional API-backed CVE sources:
 
@@ -85,10 +98,10 @@ go run ./cmd/pochunter -poc CVE 2026 38526
 
 | Flag             | Description                                      |
 |------------------|--------------------------------------------------|
-| `--search`       | Keyword search mode                              |
+| `--search`       | Free-form keyword search (no version required)   |
 | `--poc` / `-poc` | Direct POC mode (CVE ID input)                   |
-| `--app`          | Application/product name                         |
-| `--version`      | Application version                              |
+| `--app`          | Application/product name (structured mode)       |
+| `--version`      | Application version (structured mode)            |
 | `--vendor`       | Vendor name (search hint)                        |
 | `--ecosystem`    | Package ecosystem (`npm`, `pypi`, `go`, `maven`, `rubygems`, etc.) |
 | `--sources`      | Comma-separated CVE sources to query             |
@@ -119,37 +132,80 @@ import (
     "time"
 
     "github.com/Fakechippies/pochunter/cve"
+    "github.com/Fakechippies/pochunter/httpclient"
     "github.com/Fakechippies/pochunter/poc"
+    "github.com/Fakechippies/pochunter/versioncanon"
 )
+```
 
-func findCVEs(ctx context.Context, product, version string) ([]cve.Finding, error) {
-    src := cve.NVDSource{}
-    return src.Query(ctx, "", product, version, "")
+Query a single CVE source:
+
+```go
+src := cve.NVDSource{}
+findings, err := src.Query(ctx, "", "log4j", "", "")
+for _, f := range findings {
+    fmt.Println(f.CVE, f.Score, f.Detail)
+}
+```
+
+Query all sources concurrently:
+
+```go
+sources := []cve.Source{
+    cve.NVDSource{},
+    cve.CIRCLSource{},
+    cve.OSVSource{},
+    &cve.VulnersSource{APIKey: os.Getenv("VULNERS_API_KEY")},
 }
 
-func findPOCs(ctx context.Context, cveID string) ([]poc.Finding, error) {
-    src := poc.POCInGithub{}
-    return src.Query(ctx, cveID)
+var all []cve.Finding
+for _, s := range sources {
+    findings, err := s.Query(ctx, "apache", "log4j", "2.0", "maven")
+    if err != nil {
+        continue
+    }
+    all = append(all, findings...)
 }
+```
 
-func multiSource(ctx context.Context, product, version string) ([]cve.Finding, error) {
-    sources := []cve.Source{
-        cve.NVDSource{},
-        cve.CIRCLSource{},
-        cve.OSVSource{},
-    }
-    ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-    defer cancel()
+Query POCs for a CVE:
 
-    var all []cve.Finding
-    for _, s := range sources {
-        findings, err := s.Query(ctx, "", product, version, "npm")
-        if err != nil {
-            continue
-        }
-        all = append(all, findings...)
+```go
+pocSources := []poc.Source{poc.POCInGithub{}}
+for _, src := range pocSources {
+    pocs, err := src.Query(ctx, "CVE-2026-38526")
+    for _, p := range pocs {
+        fmt.Println(p.CVE, p.Owner, p.POC)
     }
-    return all, nil
+}
+```
+
+Generate version variants for fuzzy matching:
+
+```go
+variants := versioncanon.Variants("2.2.0")
+// Returns: ["2.2.0", "v2.2.0", "2.2.0.x", "v2.2.0.x", "2.2", "v2.2", "2.2.x", "v2.2.x"]
+```
+
+Make raw API calls with the HTTP client:
+
+```go
+var result map[string]interface{}
+err := httpclient.JSON(ctx, "GET", "https://api.example.com/data",
+    map[string]string{"Authorization": "Bearer token"}, nil, &result,
+)
+```
+
+### Finding struct
+
+`cve.Finding` includes a `Score` field with the CVSS base score (parsed from NVD, prefers v3.1 → v3.0 → v2.0). Other sources leave it at `0.0`.
+
+```go
+type Finding struct {
+    CVE    string
+    Source string
+    Detail string
+    Score  float64
 }
 ```
 
@@ -159,6 +215,7 @@ func multiSource(ctx context.Context, product, version string) ([]cve.Finding, e
 |----------------|------------------------------------------------|-------------|
 | `cve`          | `github.com/Fakechippies/pochunter/cve`        | Source interface + NVD, CIRCL, OSV, Vulners, GitHub Advisories |
 | `poc`          | `github.com/Fakechippies/pochunter/poc`        | Source interface + poc-in-github, search-vulns |
+| `httpclient`   | `github.com/Fakechippies/pochunter/httpclient` | Shared HTTP/JSON client used by all sources |
 | `versioncanon` | `github.com/Fakechippies/pochunter/versioncanon`| Version variant generation for fuzzy matching |
 
 ## TODO:
