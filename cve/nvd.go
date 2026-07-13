@@ -10,13 +10,24 @@ import (
 	"github.com/Fakechippies/pochunter/versioncanon"
 )
 
+var cveAliases = map[string]string{
+	"shellshock": "bash",
+	"heartbleed": "openssl",
+	"meltdown":   "intel processors",
+	"spectre":    "intel processors",
+	"poodle":     "ssl 3.0",
+	"drown":      "openssl",
+	"logjam":     "diffie-hellman",
+	"freak":      "openssl",
+}
+
 type NVDSource struct{}
 
 func (o NVDSource) Name() string { return "NVD" }
 
 func (o NVDSource) Query(ctx context.Context, vendor, product, version, ecosystem string) ([]Finding, error) {
 	if version == "" {
-		return o.queryByKeyword(ctx, product)
+		return o.freeFormQuery(ctx, product)
 	}
 
 	targeted, err := o.queryByKeyword(ctx, product+" "+version)
@@ -37,6 +48,47 @@ func (o NVDSource) Query(ctx context.Context, vendor, product, version, ecosyste
 		return filtered, nil
 	}
 	return broad, nil
+}
+
+func (o NVDSource) freeFormQuery(ctx context.Context, keyword string) ([]Finding, error) {
+	findings, err := o.queryByKeyword(ctx, keyword)
+	if err != nil {
+		return nil, err
+	}
+	if len(findings) > 0 {
+		return findings, nil
+	}
+
+	if alias, ok := cveAliases[strings.ToLower(strings.TrimSpace(keyword))]; ok {
+		aliasResults, aliasErr := o.queryByKeyword(ctx, alias)
+		if aliasErr == nil && len(aliasResults) > 0 {
+			return aliasResults, nil
+		}
+	}
+
+	words := strings.Fields(keyword)
+	if len(words) <= 1 {
+		return nil, nil
+	}
+
+	seen := make(map[string]struct{})
+	for _, word := range words {
+		if len(word) < 3 {
+			continue
+		}
+		wordResults, err := o.queryByKeyword(ctx, word)
+		if err != nil {
+			continue
+		}
+		for _, f := range wordResults {
+			key := f.CVE + "|" + f.Source + "|" + f.Detail
+			if _, ok := seen[key]; !ok {
+				seen[key] = struct{}{}
+				findings = append(findings, f)
+			}
+		}
+	}
+	return findings, nil
 }
 
 func (o NVDSource) queryByKeyword(ctx context.Context, keyword string) ([]Finding, error) {

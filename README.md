@@ -12,6 +12,8 @@ CLI tool to discover CVEs and hunt public POCs, free-form search or structured p
 - Selectable CVE sources via `--sources` flag
 - CVSS scoring: free-form search results sorted by score with a SCORE column
 - Terminal width auto-detection (ioctl TIOCGWINSZ) for full-screen table output
+- Word-splitting fallback: if multi-word search returns 0 results, each word is tried individually
+- CVE nickname aliases: common names like `shellshock`, `heartbleed`, `logjam` mapped to their product names
 - Proper table formatting with word-wrapped DETAIL column
 - Vulners source uses `/api/v4/audit/software` (CPE-based, partial match, extended catalog)
 
@@ -31,7 +33,7 @@ pochunter --search <keywords...>
 
 ### 1) Free-form search (default)
 
-Dump any keywords: no version required. Results are sorted by CVSS score (highest first) and include a SCORE column.
+Dump any keywords: no version required. Results are sorted by CVSS score (highest first) and include a SCORE column. Known CVE nicknames like `shellshock`, `heartbleed`, `logjam`, `spectre`, `meltdown` are automatically mapped to their product names.
 
 ```bash
 go run ./cmd/pochunter --search ShellShock
