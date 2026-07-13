@@ -6,6 +6,7 @@ type Finding struct {
 	CVE    string
 	Source string
 	Detail string
+	Score  float64
 }
 
 type Source interface {

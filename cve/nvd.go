@@ -15,6 +15,10 @@ type NVDSource struct{}
 func (o NVDSource) Name() string { return "NVD" }
 
 func (o NVDSource) Query(ctx context.Context, vendor, product, version, ecosystem string) ([]Finding, error) {
+	if version == "" {
+		return o.queryByKeyword(ctx, product)
+	}
+
 	targeted, err := o.queryByKeyword(ctx, product+" "+version)
 	if err != nil {
 		return nil, err
@@ -47,6 +51,23 @@ func (o NVDSource) queryByKeyword(ctx context.Context, keyword string) ([]Findin
 					Lang  string `json:"lang"`
 					Value string `json:"value"`
 				} `json:"descriptions"`
+				Metrics *struct {
+					CvssMetricV31 []struct {
+						CvssData struct {
+							BaseScore float64 `json:"baseScore"`
+						} `json:"cvssData"`
+					} `json:"cvssMetricV31"`
+					CvssMetricV30 []struct {
+						CvssData struct {
+							BaseScore float64 `json:"baseScore"`
+						} `json:"cvssData"`
+					} `json:"cvssMetricV30"`
+					CvssMetricV2 []struct {
+						CvssData struct {
+							BaseScore float64 `json:"baseScore"`
+						} `json:"cvssData"`
+					} `json:"cvssMetricV2"`
+				} `json:"metrics"`
 			} `json:"cve"`
 		} `json:"vulnerabilities"`
 	}
@@ -65,6 +86,15 @@ func (o NVDSource) queryByKeyword(ctx context.Context, keyword string) ([]Findin
 			if d.Lang == "en" {
 				find.Detail = d.Value
 				break
+			}
+		}
+		if vuln.CVE.Metrics != nil {
+			if len(vuln.CVE.Metrics.CvssMetricV31) > 0 {
+				find.Score = vuln.CVE.Metrics.CvssMetricV31[0].CvssData.BaseScore
+			} else if len(vuln.CVE.Metrics.CvssMetricV30) > 0 {
+				find.Score = vuln.CVE.Metrics.CvssMetricV30[0].CvssData.BaseScore
+			} else if len(vuln.CVE.Metrics.CvssMetricV2) > 0 {
+				find.Score = vuln.CVE.Metrics.CvssMetricV2[0].CvssData.BaseScore
 			}
 		}
 		findings = append(findings, find)

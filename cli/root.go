@@ -8,8 +8,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"text/tabwriter"
 	"time"
+	"unsafe"
 
 	"github.com/Fakechippies/pochunter/cve"
 	"github.com/Fakechippies/pochunter/poc"
@@ -97,7 +99,12 @@ func run(args []string, opts options) error {
 		return err
 	}
 
-	progressf("Searching CVEs for vendor=%q product=%q version=%q ecosystem=%q", vendor, product, version, ecosystem)
+	isFreeForm := opts.app == ""
+	if isFreeForm {
+		progressf("Free-form CVEs for query=%q", product)
+	} else {
+		progressf("Searching CVEs for vendor=%q product=%q version=%q ecosystem=%q", vendor, product, version, ecosystem)
+	}
 
 	cveResults := collectCVEs(ctx, cveSources, vendor, product, version, ecosystem)
 	allCVEFindings, uniqueCVEs := dedupeCVEs(cveResults)
@@ -107,7 +114,12 @@ func run(args []string, opts options) error {
 		return nil
 	}
 
-	printCVEFindings("CVE Discovery", allCVEFindings)
+	if isFreeForm {
+		sort.SliceStable(allCVEFindings, func(i, j int) bool {
+			return allCVEFindings[i].Score > allCVEFindings[j].Score
+		})
+	}
+	printCVEFindings("CVE Discovery", allCVEFindings, isFreeForm)
 	successf("Unique CVEs: %d", len(uniqueCVEs))
 	printCVESourceErrors(cveResults)
 
@@ -350,11 +362,11 @@ func resolveSearchInput(args []string, opts options) (string, string, string, st
 	}
 
 	if opts.searchMode || len(args) > 0 {
-		if len(args) < 2 {
-			return "", "", "", "", fmt.Errorf("keyword mode expects: --search <product words...> <version>")
+		if len(args) < 1 {
+			return "", "", "", "", fmt.Errorf("search mode expects at least one keyword")
 		}
-		product := strings.Join(args[:len(args)-1], " ")
-		version := args[len(args)-1]
+		product := strings.Join(args, " ")
+		version := ""
 		return vendor, product, version, ecosystem, nil
 	}
 
@@ -404,7 +416,7 @@ func normalizeCVE(args []string) string {
 	return strings.ToUpper(strings.Join(args, "-"))
 }
 
-func printCVEFindings(source string, findings []cve.Finding) {
+func printCVEFindings(source string, findings []cve.Finding, showScore bool) {
 	if len(findings) == 0 {
 		warnf("%s: no CVEs found", source)
 		return
@@ -414,6 +426,7 @@ func printCVEFindings(source string, findings []cve.Finding) {
 
 	cveW := len("CVE")
 	srcW := len("SOURCE")
+	scoreW := len("SCORE")
 	for _, f := range findings {
 		if len(f.CVE) > cveW {
 			cveW = len(f.CVE)
@@ -423,6 +436,38 @@ func printCVEFindings(source string, findings []cve.Finding) {
 		}
 	}
 	gap := 2
+
+	if showScore {
+		for _, f := range findings {
+			s := fmt.Sprintf("%.1f", f.Score)
+			if len(s) > scoreW {
+				scoreW = len(s)
+			}
+		}
+		detailW := terminalWidth() - cveW - srcW - scoreW - gap*3
+		if detailW < 20 {
+			detailW = 20
+		}
+
+		fmt.Printf("%-*s%*s%*s  %s\n", cveW, "CVE", srcW+gap, "SOURCE", scoreW+gap, "SCORE", "DETAIL")
+		fmt.Printf("%s%s%s  %s\n", strings.Repeat("-", cveW), strings.Repeat("-", srcW+gap), strings.Repeat("-", scoreW+gap), strings.Repeat("-", detailW))
+
+		for _, f := range findings {
+			detail := strings.ReplaceAll(f.Detail, "\n", " ")
+			detail = strings.ReplaceAll(detail, "\r", "")
+			lines := wrapText(detail, detailW)
+			score := fmt.Sprintf("%.1f", f.Score)
+			for i, line := range lines {
+				if i == 0 {
+					fmt.Printf("%-*s%*s%*s  %s\n", cveW, f.CVE, srcW+gap, f.Source, scoreW+gap, score, line)
+				} else {
+					fmt.Printf("%-*s%*s%*s  %s\n", cveW, "", srcW+gap, "", scoreW+gap, "", line)
+				}
+			}
+		}
+		return
+	}
+
 	detailW := terminalWidth() - cveW - srcW - gap*2
 	if detailW < 20 {
 		detailW = 20
@@ -475,14 +520,25 @@ func errorf(format string, args ...interface{}) {
 	fmt.Printf("%s[!]%s %s\n", colorRed, colorReset, fmt.Sprintf(format, args...))
 }
 
+type winsize struct {
+	Row    uint16
+	Col    uint16
+	Xpixel uint16
+	Ypixel uint16
+}
+
 func terminalWidth() int {
-	const defaultWidth = 80
 	if cols := os.Getenv("COLUMNS"); cols != "" {
 		if w, err := strconv.Atoi(cols); err == nil && w > 0 {
 			return w
 		}
 	}
-	return defaultWidth
+	ws := &winsize{}
+	ret, _, _ := syscall.Syscall(syscall.SYS_IOCTL, os.Stdout.Fd(), syscall.TIOCGWINSZ, uintptr(unsafe.Pointer(ws)))
+	if ret >= 0 && ws.Col > 0 {
+		return int(ws.Col)
+	}
+	return 80
 }
 
 func wrapText(s string, width int) []string {
